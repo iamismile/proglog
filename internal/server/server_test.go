@@ -7,10 +7,11 @@ import (
 	"testing"
 
 	api "github.com/iamismile/proglog/api/v1"
+	"github.com/iamismile/proglog/internal/config"
 	"github.com/iamismile/proglog/internal/log"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 )
 
@@ -43,19 +44,40 @@ func setupTest(t *testing.T, fn func(*Config)) (
 	t.Helper()
 
 	// Start TCP listener on random port
-	l, err := net.Listen("tcp", ":0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	// Create gRPC client connection options which
-	// disable TLS for test environment
-	clientOptions := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	}
-
-	// Configure gRPC client with server address
-	// and dial options (lazy dial - no connection yet
-	cc, err := grpc.NewClient(l.Addr().String(), clientOptions...)
+	// Build client TLS — loads client cert/key (proves client identity to server)
+	// and CA (used to verify the server's certificate).
+	clientTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile: config.ClientCertFile,
+		KeyFile:  config.ClientKeyFile,
+		CAFile:   config.CAFile,
+	})
 	require.NoError(t, err)
+
+	// Wrap the TLS config into gRPC transport credentials and open the connection.
+	// No actual network dial happens here — gRPC dials lazily on first RPC call.
+	clientCreds := credentials.NewTLS(clientTLSConfig)
+	cc, err := grpc.NewClient(
+		l.Addr().String(),
+		grpc.WithTransportCredentials(clientCreds),
+	)
+	require.NoError(t, err)
+	client = api.NewLogClient(cc)
+
+	// Build server TLS — loads server cert/key (proves server identity to client)
+	// and CA (used to verify incoming client certificates — this is mTLS).
+	serverTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile:      config.ServerCertFile,
+		KeyFile:       config.ServerKeyFile,
+		CAFile:        config.CAFile,
+		ServerAddress: l.Addr().String(),
+		Server:        true,
+	})
+	require.NoError(t, err)
+
+	serverCreds := credentials.NewTLS(serverTLSConfig)
 
 	// Create temporary directory for log data
 	dir, err := os.MkdirTemp("", "server-test")
@@ -70,29 +92,27 @@ func setupTest(t *testing.T, fn func(*Config)) (
 		CommitLog: clog,
 	}
 
-	// Apply optional config changes
+	// fn lets individual test cases tweak the config before the server starts.
 	if fn != nil {
 		fn(cfg)
 	}
 
 	// Create gRPC server
-	server, err := NewGRPCServer(cfg)
+	server, err := NewGRPCServer(cfg, grpc.Creds(serverCreds))
 	require.NoError(t, err)
 
-	// Run server in background goroutine
+	// Serve blocks, so run it in a goroutine.
+	// server.Stop() in teardown triggers a graceful shutdown.
 	go func() {
 		server.Serve(l)
 	}()
 
-	// Create log service client
-	client = api.NewLogClient(cc)
-
 	// Return cleanup function
 	return client, cfg, func() {
-		server.Stop()
-		cc.Close()
-		l.Close()
-		clog.Remove()
+		server.Stop() // graceful shutdown, waits for in-flight RPCs
+		cc.Close()    // close client connection
+		l.Close()     // release the port
+		clog.Remove() // delete temp log files from disk
 	}
 }
 
