@@ -19,7 +19,8 @@ func TestLog(t *testing.T) {
 		"truncate":                          testTruncate,
 	} {
 		t.Run(scenario, func(t *testing.T) {
-			dir := os.TempDir()
+			dir, err := os.MkdirTemp("", "log-test")
+			require.NoError(t, err)
 			defer os.RemoveAll(dir)
 
 			c := Config{}
