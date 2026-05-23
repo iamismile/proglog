@@ -3,8 +3,20 @@ package server
 import (
 	"context"
 
+	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
 	api "github.com/iamismile/proglog/api/v1"
+
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	objectWildCard = "*"
+	produceAction  = "produce"
+	consumeAction  = "consume"
 )
 
 // CommitLog abstracts the log so the server isn't tied to a concrete implementation.
@@ -14,9 +26,14 @@ type CommitLog interface {
 	Read(uint64) (*api.Record, error)
 }
 
+type Authorizer interface {
+	Authorize(subject, object, action string) error
+}
+
 // Config holds dependencies injected into the server.
 type Config struct {
-	CommitLog CommitLog
+	CommitLog  CommitLog
+	Authorizer Authorizer
 }
 
 type grpcServer struct {
@@ -25,6 +42,18 @@ type grpcServer struct {
 }
 
 func NewGRPCServer(config *Config, opts ...grpc.ServerOption) (*grpc.Server, error) {
+	opts = append(
+		opts,
+
+		grpc.ChainUnaryInterceptor(
+			grpc_auth.UnaryServerInterceptor(authenticate),
+		),
+
+		grpc.ChainStreamInterceptor(
+			grpc_auth.StreamServerInterceptor(authenticate),
+		),
+	)
+
 	gsrv := grpc.NewServer(opts...)
 	srv, err := newgrpcServer(config)
 	if err != nil {
@@ -46,6 +75,14 @@ func newgrpcServer(config *Config) (srv *grpcServer, err error) {
 // --- Unary RPCs ---
 
 func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (*api.ProduceResponse, error) {
+	if err := s.Authorizer.Authorize(
+		subject(ctx),
+		objectWildCard,
+		produceAction,
+	); err != nil {
+		return nil, err
+	}
+
 	offset, err := s.CommitLog.Append(req.Record)
 	if err != nil {
 		return nil, err
@@ -55,6 +92,14 @@ func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (*api
 }
 
 func (s *grpcServer) Consume(ctx context.Context, req *api.ConsumeRequest) (*api.ConsumeResponse, error) {
+	if err := s.Authorizer.Authorize(
+		subject(ctx),
+		objectWildCard,
+		consumeAction,
+	); err != nil {
+		return nil, err
+	}
+
 	record, err := s.CommitLog.Read(req.Offset)
 	if err != nil {
 		return nil, err
@@ -140,4 +185,47 @@ func (s *grpcServer) ConsumeStream(req *api.ConsumeRequest, stream api.Log_Consu
 			req.Offset++
 		}
 	}
+}
+
+// authenticate is a gRPC interceptor helper function
+// It runs for every incoming request before the actual RPC handler
+func authenticate(ctx context.Context) (context.Context, error) {
+	// Extract "peer" (client) information from the context
+	// Peer contains info about the client connection (IP, TLS, etc.)
+	peer, ok := peer.FromContext(ctx)
+
+	// If cannot get peer info, cannot continue safely.
+	if !ok {
+		return ctx, status.New(
+			codes.Unknown,
+			"couldn't find peer info",
+		).Err()
+	}
+
+	// If there is NO authentication info (no TLS/mTLS used)
+	// return context with empty subject (anonymous user)
+	if peer.AuthInfo == nil {
+		return context.WithValue(ctx, subjectContextKey{}, ""), nil
+	}
+
+	// Type assertion:
+	// Expect AuthInfo to contain TLS details (mTLS connection)
+	tlsInfo := peer.AuthInfo.(credentials.TLSInfo)
+
+	// Extract identity from client certificate:
+	// VerifiedChains[0][0] → first certificate in first verified chain
+	// Subject.CommonName → identity (like username/service name)
+	subject := tlsInfo.State.VerifiedChains[0][0].Subject.CommonName
+
+	// Store the extracted subject inside the context
+	ctx = context.WithValue(ctx, subjectContextKey{}, subject)
+
+	// Return new context with identity attached
+	return ctx, nil
+}
+
+type subjectContextKey struct{}
+
+func subject(ctx context.Context) string {
+	return ctx.Value(subjectContextKey{}).(string)
 }
